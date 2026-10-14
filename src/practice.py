@@ -6,19 +6,19 @@ import socket
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Callable, Dict, List, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 NUGET_ID_RE = re.compile(r"^[A-Za-z0-9_]+([.-][A-Za-z0-9_]+)*$")
-TEST_ID_RE = re.compile(r"^[A-Z]+$") 
+TEST_ID_RE = re.compile(r"^[A-Z]+$")  
 VERSION_RE = re.compile(
     r"^\d+(\.\d+){1,3}(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$"
 )
 FORBIDDEN_FILENAME_CHARS = set('<>:"|?*\0')
 HTTP_TIMEOUT = 15  
-USER_AGENT = "depgraph/0.2 (educational project)"
+USER_AGENT = "depgraph/0.3 (educational project)"
 
 
 class ConfigError(Exception):
@@ -123,9 +123,13 @@ def validate_output(output: str) -> None:
         raise ConfigError(f"--output: нет прав на запись в каталог '{directory}'")
 
 
-def validate_filter(substr: str) -> None:
+def validate_filter(substr: str, package: str) -> None:
     if substr != "" and not substr.strip():
         raise ConfigError("--filter: подстрока не может состоять только из пробелов")
+    if substr and package and substr.lower() in package.lower():
+        raise ConfigError(
+            f"--filter: подстрока '{substr}' входит в имя анализируемого пакета '{package}', "
+            f"анализировать было бы нечего")
 
 
 def validate(args: argparse.Namespace) -> Config:
@@ -136,7 +140,7 @@ def validate(args: argparse.Namespace) -> Config:
         lambda: validate_repo(args.repo, args.test_mode),
         lambda: validate_version(args.version, args.test_mode),
         lambda: validate_output(args.output),
-        lambda: validate_filter(args.filter),
+        lambda: validate_filter(args.filter, args.package),
     )
     for check in checks:
         try:
@@ -153,7 +157,7 @@ def validate(args: argparse.Namespace) -> Config:
 class Dependency:
     """Прямая зависимость пакета, объединённая по всем target framework."""
     id: str
-    version_range: str                 
+    version_range: str                  
     frameworks: List[str] = field(default_factory=list)
 
     @property
@@ -216,7 +220,7 @@ def parse_dependencies(nuspec: bytes) -> List[Dependency]:
         raise RepoError("в .nuspec отсутствует элемент <metadata>")
     deps_el = next((c for c in metadata if local_name(c.tag) == "dependencies"), None)
     if deps_el is None:
-        return [] 
+        return []  
 
     found: Dict[str, Dependency] = {}
 
@@ -224,7 +228,7 @@ def parse_dependencies(nuspec: bytes) -> List[Dependency]:
         dep_id = dep_el.get("id")
         if not dep_id:
             return
-        key = dep_id.lower()  
+        key = dep_id.lower() 
         dep = found.setdefault(key, Dependency(dep_id, dep_el.get("version", "")))
         if framework not in dep.frameworks:
             dep.frameworks.append(framework)
@@ -258,9 +262,13 @@ def resolve_version(version_range: str) -> str:
     return rng
 
 
-def get_direct_dependencies(repo_url: str, package: str, version: str) -> List[Dependency]:
-    """Прямые зависимости пакета заданной версии по URL репозитория NuGet v3."""
-    base = find_package_base_address(repo_url)
+def get_direct_dependencies(repo_url: str, package: str, version: str,
+                            base: str = "") -> List[Dependency]:
+    """Прямые зависимости пакета заданной версии по URL репозитория NuGet v3.
+
+    base — уже найденный PackageBaseAddress (чтобы не читать service index повторно).
+    """
+    base = base or find_package_base_address(repo_url)
     pid = package.lower()                     
     ver = version.split("+", 1)[0].lower()    
     url = f"{base}{pid}/{ver}/{pid}.nuspec"
@@ -273,12 +281,146 @@ def get_direct_dependencies(repo_url: str, package: str, version: str) -> List[D
     return parse_dependencies(nuspec)
 
 
-def print_direct_dependencies(package: str, version: str, deps: List[Dependency]) -> None:
-    """(только для этапа 2) вывод прямых зависимостей."""
-    print(f"Прямые зависимости {package} {version}: {len(deps)}")
-    for d in deps:
-        rng = d.version_range or "(версия не указана)"
-        print(f"  {d.id}  {rng}  -> {d.min_version or '?'}  [{', '.join(d.frameworks)}]")
+ChildrenFn = Callable[[str, str], List[Tuple[str, str]]]
+
+
+@dataclass
+class GraphResult:
+    root: str
+    graph: Dict[str, List[str]]      
+    versions: Dict[str, str]         
+    cycles: List[List[str]]          
+    skipped: List[str]               
+
+
+def build_graph(root: str, root_version: str, get_children: ChildrenFn,
+                substring: str = "") -> GraphResult:
+    """Строит граф зависимостей с учётом транзитивности рекурсивным DFS.
+
+    * Пакеты, чьё имя содержит substring (без учёта регистра), не анализируются
+      и в граф не попадают.
+    * Цикл обнаруживается как ребро в пакет, который сейчас находится в стеке
+      рекурсии: ребро сохраняется, но рекурсия в него не идёт.
+    * Уже обработанный пакет повторно не раскрывается (ромбовидные зависимости).
+    """
+    sub = substring.lower()
+    graph: Dict[str, List[str]] = {}
+    versions: Dict[str, str] = {}
+    cycles: List[List[str]] = []
+    skipped: List[str] = []
+    canon: Dict[str, str] = {}      
+    stack: List[str] = []            
+    on_stack = set()
+
+    def dfs(name: str, version: str) -> None:
+        graph[name] = []
+        versions[name] = version
+        stack.append(name)
+        on_stack.add(name)
+        for dep_name, dep_version in get_children(name, version):
+            if sub and sub in dep_name.lower():
+                if dep_name not in skipped:
+                    skipped.append(dep_name)
+                continue
+            dep = canon.setdefault(dep_name.lower(), dep_name)
+            if dep not in graph[name]:
+                graph[name].append(dep)
+            if dep in on_stack:                       
+                cycles.append(stack[stack.index(dep):] + [dep])
+            elif dep not in graph:                    
+                dfs(dep, dep_version)
+        stack.pop()
+        on_stack.discard(name)
+
+    root = canon.setdefault(root.lower(), root)
+    dfs(root, root_version)
+    return GraphResult(root, graph, versions, cycles, skipped)
+
+
+def parse_test_repo(path: str) -> Dict[str, List[str]]:
+    """Читает файл описания графа. Формат строки:  A: B C   (зависимости через пробел).
+
+    Пустые строки и строки, начинающиеся с '#', игнорируются.
+    Пакет без зависимостей:  C:
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeDecodeError) as e:
+        raise RepoError(f"не удалось прочитать файл '{path}': {e}") from e
+
+    repo: Dict[str, List[str]] = {}
+    for n, raw in enumerate(lines, 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        where = f"{path}:{n}"
+        if ":" not in line:
+            raise RepoError(f"{where}: ожидался формат 'A: B C', получено '{raw.strip()}'")
+        left, right = line.split(":", 1)
+        name = left.strip()
+        if not TEST_ID_RE.fullmatch(name):
+            raise RepoError(f"{where}: имя пакета '{name}' должно состоять из заглавных латинских букв")
+        if name in repo:
+            raise RepoError(f"{where}: пакет '{name}' описан повторно")
+        deps = right.split()
+        for d in deps:
+            if not TEST_ID_RE.fullmatch(d):
+                raise RepoError(f"{where}: имя зависимости '{d}' должно состоять из заглавных латинских букв")
+        repo[name] = deps
+    if not repo:
+        raise RepoError(f"файл '{path}' не содержит описания ни одного пакета")
+    return repo
+
+
+def make_test_children(repo: Dict[str, List[str]]) -> ChildrenFn:
+    return lambda name, version: [(d, "") for d in repo.get(name, [])]
+
+
+def make_nuget_children(repo_url: str) -> ChildrenFn:
+    """Провайдер прямых зависимостей из NuGet с кэшем.
+
+    Версия транзитивной зависимости — нижняя граница диапазона из .nuspec.
+    """
+    base = find_package_base_address(repo_url)
+    cache: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+
+    def children(name: str, version: str) -> List[Tuple[str, str]]:
+        key = (name.lower(), version)
+        if key not in cache:
+            result = []
+            for d in get_direct_dependencies(repo_url, name, version, base):
+                if not d.min_version:
+                    raise RepoError(f"у зависимости {d.id} пакета {name} {version} не указана версия")
+                if not VERSION_RE.fullmatch(d.min_version):
+                    raise RepoError(
+                        f"не удалось определить версию зависимости {d.id} "
+                        f"из диапазона '{d.version_range}' (пакет {name} {version})")
+                result.append((d.id, d.min_version))
+            cache[key] = result
+        return cache[key]
+
+    return children
+
+
+def print_graph(res: GraphResult, substring: str) -> None:
+    def label(name: str) -> str:
+        v = res.versions.get(name, "")
+        return f"{name} {v}" if v else name
+
+    edges = sum(len(d) for d in res.graph.values())
+    print(f"Граф зависимостей пакета {label(res.root)}: пакетов {len(res.graph)}, рёбер {edges}")
+    for name, deps in res.graph.items():
+        right = ", ".join(label(d) for d in deps) if deps else "(нет зависимостей)"
+        print(f"  {label(name)} -> {right}")
+    if res.cycles:
+        print(f"Циклические зависимости ({len(res.cycles)}):")
+        for c in res.cycles:
+            print("  " + " -> ".join(label(x) for x in c))
+    else:
+        print("Циклических зависимостей нет")
+    if res.skipped:
+        print(f"Пропущено по фильтру '{substring}': {', '.join(res.skipped)}")
 
 
 def main(argv=None) -> int:
@@ -292,20 +434,29 @@ def main(argv=None) -> int:
             print(f"  {line}", file=sys.stderr)
         return 2
 
-    if cfg.test_mode:
-        print("Тестовый режим будет реализован на этапе 3.", file=sys.stderr)
-        return 0
-
+    sys.setrecursionlimit(5000)
     try:
-        deps = get_direct_dependencies(cfg.repo, cfg.package, cfg.version)
+        if cfg.test_mode:
+            repo = parse_test_repo(cfg.repo)
+            if cfg.package not in repo:
+                raise RepoError(f"пакет '{cfg.package}' не описан в тестовом репозитории '{cfg.repo}'")
+            children, version = make_test_children(repo), ""
+        else:
+            children, version = make_nuget_children(cfg.repo), cfg.version
+        result = build_graph(cfg.package, version, children, cfg.filter)
     except RepoError as e:
         print(f"Ошибка репозитория: {e}", file=sys.stderr)
         return 3
-    print_direct_dependencies(cfg.package, cfg.version, deps)
+    except RecursionError:
+        print("Ошибка: слишком глубокая вложенность зависимостей", file=sys.stderr)
+        return 3
+
+    print_graph(result, cfg.filter)
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
  
