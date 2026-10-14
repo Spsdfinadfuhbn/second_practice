@@ -1,20 +1,32 @@
 import argparse
+import json
 import os
 import re
+import socket
 import sys
-from dataclasses import dataclass
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from typing import Dict, List
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 NUGET_ID_RE = re.compile(r"^[A-Za-z0-9_]+([.-][A-Za-z0-9_]+)*$")
-TEST_ID_RE = re.compile(r"^[A-Z]+$")
+TEST_ID_RE = re.compile(r"^[A-Z]+$") 
 VERSION_RE = re.compile(
     r"^\d+(\.\d+){1,3}(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$"
 )
 FORBIDDEN_FILENAME_CHARS = set('<>:"|?*\0')
+HTTP_TIMEOUT = 15  
+USER_AGENT = "depgraph/0.2 (educational project)"
 
 
 class ConfigError(Exception):
     """Ошибка пользовательской конфигурации."""
+
+
+class RepoError(Exception):
+    """Ошибка получения или разбора данных репозитория."""
 
 
 @dataclass
@@ -35,34 +47,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-p", "--package", required=True,
                    help="имя анализируемого пакета")
-    p.add_argument(
-        "-r",
-        "--repo",
-        required=True,
-        help="URL репозитория (https://api.nuget.org/v3/index.json) "
-        "или путь к файлу тестового репозитория (с --test-mode)")
-    p.add_argument(
-        "-t",
-        "--test-mode",
-        action="store_true",
-        help="режим работы с тестовым репозиторием (--repo — путь к файлу)")
-    p.add_argument(
-        "-v",
-        "--version",
-        default="",
-        help="версия пакета, например 13.0.3 (обязательна вне тестового режима)")
-    p.add_argument(
-        "-o",
-        "--output",
-        default="graph.png",
-        help="имя файла с изображением графа (.png), по умолчанию graph.png")
+    p.add_argument("-r", "--repo", required=True,
+                   help="URL репозитория (https://api.nuget.org/v3/index.json) "
+                        "или путь к файлу тестового репозитория (с --test-mode)")
+    p.add_argument("-t", "--test-mode", action="store_true",
+                   help="режим работы с тестовым репозиторием (--repo — путь к файлу)")
+    p.add_argument("-v", "--version", default="",
+                   help="версия пакета, например 13.0.3 (обязательна вне тестового режима)")
+    p.add_argument("-o", "--output", default="graph.png",
+                   help="имя файла с изображением графа (.png), по умолчанию graph.png")
     p.add_argument("-a", "--ascii-tree", action="store_true",
                    help="вывести зависимости в виде ASCII-дерева")
-    p.add_argument(
-        "-f",
-        "--filter",
-        default="",
-        help="подстрока: пакеты, в имени которых она есть, не анализируются")
+    p.add_argument("-f", "--filter", default="",
+                   help="подстрока: пакеты, в имени которых она есть, не анализируются")
     return p
 
 
@@ -101,8 +98,7 @@ def validate_repo(repo: str, test_mode: bool) -> None:
 def validate_version(version: str, test_mode: bool) -> None:
     if not version:
         if not test_mode:
-            raise ConfigError(
-                "--version: версия обязательна вне тестового режима")
+            raise ConfigError("--version: версия обязательна вне тестового режима")
         return
     if not VERSION_RE.fullmatch(version):
         raise ConfigError(
@@ -113,11 +109,9 @@ def validate_output(output: str) -> None:
     if not output or not output.strip():
         raise ConfigError("--output: имя файла не может быть пустым")
     if any(c in FORBIDDEN_FILENAME_CHARS for c in output):
-        raise ConfigError(
-            f"--output: имя '{output}' содержит недопустимые символы")
+        raise ConfigError(f"--output: имя '{output}' содержит недопустимые символы")
     if not output.lower().endswith(".png"):
-        raise ConfigError(
-            f"--output: файл должен иметь расширение .png, получено '{output}'")
+        raise ConfigError(f"--output: файл должен иметь расширение .png, получено '{output}'")
     if os.path.basename(output) in ("", ".png"):
         raise ConfigError("--output: у файла отсутствует имя")
     directory = os.path.dirname(output) or "."
@@ -126,14 +120,12 @@ def validate_output(output: str) -> None:
     if os.path.isdir(output):
         raise ConfigError(f"--output: '{output}' — это каталог")
     if not os.access(directory, os.W_OK):
-        raise ConfigError(
-            f"--output: нет прав на запись в каталог '{directory}'")
+        raise ConfigError(f"--output: нет прав на запись в каталог '{directory}'")
 
 
 def validate_filter(substr: str) -> None:
     if substr != "" and not substr.strip():
-        raise ConfigError(
-            "--filter: подстрока не может состоять только из пробелов")
+        raise ConfigError("--filter: подстрока не может состоять только из пробелов")
 
 
 def validate(args: argparse.Namespace) -> Config:
@@ -157,19 +149,136 @@ def validate(args: argparse.Namespace) -> Config:
                   args.output, args.ascii_tree, args.filter)
 
 
-def print_config(cfg: Config) -> None:
-    """(только для этапа 1) вывод параметров в формате ключ-значение."""
-    items = {
-        "package": cfg.package,
-        "repo": cfg.repo,
-        "test_mode": cfg.test_mode,
-        "version": cfg.version or "(не задана)",
-        "output": cfg.output,
-        "ascii_tree": cfg.ascii_tree,
-        "filter": cfg.filter or "(не задан)",
-    }
-    for key, value in items.items():
-        print(f"{key}: {value}")
+@dataclass
+class Dependency:
+    """Прямая зависимость пакета, объединённая по всем target framework."""
+    id: str
+    version_range: str                 
+    frameworks: List[str] = field(default_factory=list)
+
+    @property
+    def min_version(self) -> str:
+        return resolve_version(self.version_range)
+
+
+def http_get(url: str) -> bytes:
+    """GET-запрос средствами стандартной библиотеки с обработкой сетевых ошибок."""
+    req = Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return resp.read()
+    except HTTPError as e:
+        if e.code == 404:
+            raise RepoError(f"ресурс не найден (HTTP 404): {url}") from e
+        raise RepoError(f"сервер вернул HTTP {e.code} для {url}") from e
+    except (socket.timeout, TimeoutError) as e:
+        raise RepoError(f"превышено время ожидания ({HTTP_TIMEOUT} c): {url}") from e
+    except URLError as e:
+        raise RepoError(f"не удалось подключиться к {url}: {e.reason}") from e
+
+
+def find_package_base_address(index_url: str) -> str:
+    """Читает service index (v3/index.json) и находит ресурс PackageBaseAddress."""
+    raw = http_get(index_url)
+    try:
+        index = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise RepoError(f"{index_url} не является корректным JSON (service index NuGet v3)") from e
+
+    resources = index.get("resources") if isinstance(index, dict) else None
+    if not isinstance(resources, list):
+        raise RepoError(f"в {index_url} нет списка 'resources': это не NuGet v3 service index")
+
+    for res in resources:
+        types = res.get("@type", []) if isinstance(res, dict) else []
+        if isinstance(types, str):
+            types = [types]
+        if any(t.startswith("PackageBaseAddress") for t in types) and res.get("@id"):
+            base = res["@id"]
+            return base if base.endswith("/") else base + "/"
+    raise RepoError("в service index не найден ресурс PackageBaseAddress")
+
+
+def local_name(tag: str) -> str:
+    """Имя тега без пространства имён (xmlns в .nuspec бывает разным)."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_dependencies(nuspec: bytes) -> List[Dependency]:
+    """Извлекает <dependency> из всех <group> (и из <dependencies> без групп)."""
+    try:
+        root = ET.fromstring(nuspec)
+    except ET.ParseError as e:
+        raise RepoError(f"некорректный XML в .nuspec: {e}") from e
+
+    metadata = next((c for c in root if local_name(c.tag) == "metadata"), None)
+    if metadata is None:
+        raise RepoError("в .nuspec отсутствует элемент <metadata>")
+    deps_el = next((c for c in metadata if local_name(c.tag) == "dependencies"), None)
+    if deps_el is None:
+        return [] 
+
+    found: Dict[str, Dependency] = {}
+
+    def add(dep_el, framework: str) -> None:
+        dep_id = dep_el.get("id")
+        if not dep_id:
+            return
+        key = dep_id.lower()  
+        dep = found.setdefault(key, Dependency(dep_id, dep_el.get("version", "")))
+        if framework not in dep.frameworks:
+            dep.frameworks.append(framework)
+
+    for child in deps_el:
+        name = local_name(child.tag)
+        if name == "group":
+            fw = child.get("targetFramework") or "any"
+            for d in child:
+                if local_name(d.tag) == "dependency":
+                    add(d, fw)
+        elif name == "dependency":
+            add(child, "any")
+    return list(found.values())
+
+
+def resolve_version(version_range: str) -> str:
+    """Выбирает конкретную версию из диапазона NuGet: нижнюю границу.
+
+    "1.0" -> 1.0; "[1.0, )" -> 1.0; "[1.0]" -> 1.0; "(, 2.0]" -> 2.0.
+    Исключающие границы упрощённо трактуются как включающие.
+    """
+    rng = version_range.strip()
+    if not rng:
+        return ""
+    if rng[0] in "[(":
+        parts = [p.strip() for p in rng[1:-1].split(",")]
+        if parts[0]:
+            return parts[0]
+        return parts[1] if len(parts) > 1 else ""
+    return rng
+
+
+def get_direct_dependencies(repo_url: str, package: str, version: str) -> List[Dependency]:
+    """Прямые зависимости пакета заданной версии по URL репозитория NuGet v3."""
+    base = find_package_base_address(repo_url)
+    pid = package.lower()                     
+    ver = version.split("+", 1)[0].lower()    
+    url = f"{base}{pid}/{ver}/{pid}.nuspec"
+    try:
+        nuspec = http_get(url)
+    except RepoError as e:
+        if "HTTP 404" in str(e):
+            raise RepoError(f"пакет {package} версии {version} не найден в репозитории") from e
+        raise
+    return parse_dependencies(nuspec)
+
+
+def print_direct_dependencies(package: str, version: str, deps: List[Dependency]) -> None:
+    """(только для этапа 2) вывод прямых зависимостей."""
+    print(f"Прямые зависимости {package} {version}: {len(deps)}")
+    for d in deps:
+        rng = d.version_range or "(версия не указана)"
+        print(f"  {d.id}  {rng}  -> {d.min_version or '?'}  [{', '.join(d.frameworks)}]")
 
 
 def main(argv=None) -> int:
@@ -182,9 +291,21 @@ def main(argv=None) -> int:
         for line in str(e).splitlines():
             print(f"  {line}", file=sys.stderr)
         return 2
-    print_config(cfg)
+
+    if cfg.test_mode:
+        print("Тестовый режим будет реализован на этапе 3.", file=sys.stderr)
+        return 0
+
+    try:
+        deps = get_direct_dependencies(cfg.repo, cfg.package, cfg.version)
+    except RepoError as e:
+        print(f"Ошибка репозитория: {e}", file=sys.stderr)
+        return 3
+    print_direct_dependencies(cfg.package, cfg.version, deps)
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
+ 
