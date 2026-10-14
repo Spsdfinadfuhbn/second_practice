@@ -423,9 +423,49 @@ def print_graph(res: GraphResult, substring: str) -> None:
         print(f"Пропущено по фильтру '{substring}': {', '.join(res.skipped)}")
 
 
+def load_order(res: GraphResult) -> List[str]:
+    """Порядок загрузки: пост-порядок рекурсивного DFS.
+
+    Пакет попадает в список после всех своих зависимостей, поэтому при
+    установке в этом порядке каждый пакет получает уже загруженные
+    зависимости. Корневой пакет всегда последний. Обратные рёбра циклов
+    игнорируются (цикл «разрывается» там, где DFS в него вернулся), а при
+    ромбовидных зависимостях общий пакет загружается один раз.
+    """
+    order: List[str] = []
+    visited = set()
+
+    def visit(name: str) -> None:
+        visited.add(name)
+        for dep in res.graph.get(name, []):
+            if dep not in visited:
+                visit(dep)
+        order.append(name)
+
+    visit(res.root)
+    return order
+
+
+def print_load_order(res: GraphResult, substring: str) -> None:
+    """(только для этапа 4) вывод порядка загрузки."""
+    def label(name: str) -> str:
+        v = res.versions.get(name, "")
+        return f"{name} {v}" if v else name
+
+    order = load_order(res)
+    print(f"Порядок загрузки зависимостей пакета {label(res.root)} ({len(order)}):")
+    for i, name in enumerate(order, 1):
+        print(f"  {i}. {label(name)}")
+    if res.cycles:
+        broken = ", ".join(f"{label(c[-2])} -> {label(c[-1])}" for c in res.cycles)
+        print(f"Циклы разорваны по рёбрам: {broken}")
+    if res.skipped:
+        print(f"Пропущено по фильтру '{substring}': {', '.join(res.skipped)}")
+
+
 def main(argv=None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv) 
     try:
         cfg = validate(args)
     except ConfigError as e:
@@ -451,9 +491,11 @@ def main(argv=None) -> int:
         print("Ошибка: слишком глубокая вложенность зависимостей", file=sys.stderr)
         return 3
 
-    print_graph(result, cfg.filter)
+    if cfg.load_order:
+        print_load_order(result, cfg.filter)
+    else:
+        print_graph(result, cfg.filter)
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
