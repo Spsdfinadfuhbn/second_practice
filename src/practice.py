@@ -463,6 +463,140 @@ def print_load_order(res: GraphResult, substring: str) -> None:
         print(f"Пропущено по фильтру '{substring}': {', '.join(res.skipped)}")
 
 
+class RenderError(Exception):
+    """Ошибка построения изображения."""
+
+
+def _label(res: GraphResult, name: str) -> str:
+    v = res.versions.get(name, "")
+    return f"{name} {v}" if v else name
+
+
+def to_plantuml(res: GraphResult) -> str:
+    """Текстовое представление графа на языке PlantUML.
+
+    Корень выделен цветом, рёбра, замыкающие цикл, — красным пунктиром.
+    Все узлы объявляются явно, поэтому пакет без зависимостей тоже виден.
+    """
+    ids = {name: f"n{i}" for i, name in enumerate(res.graph)}
+    back = {(c[-2], c[-1]) for c in res.cycles}
+    lines = ["@startuml", f"title Зависимости {_label(res, res.root)}", "skinparam shadowing false"]
+    for name, nid in ids.items():
+        color = " #LightSkyBlue" if name == res.root else ""
+        lines.append(f'rectangle "{_label(res, name)}" as {nid}{color}')
+    for name, deps in res.graph.items():
+        for dep in deps:
+            if (name, dep) in back:
+                lines.append(f"{ids[name]} -[#red,dashed]-> {ids[dep]} : цикл")
+            else:
+                lines.append(f"{ids[name]} --> {ids[dep]}")
+    lines.append("@enduml")
+    return "\n".join(lines) + "\n"
+
+
+def ascii_tree(res: GraphResult) -> str:
+    """Зависимости в виде ASCII-дерева (рекурсивный обход).
+
+    (*) — поддерево этого пакета уже показано выше; (цикл) — возврат к предку.
+    """
+    lines = [_label(res, res.root)]
+    shown = {res.root}
+    path = {res.root}
+    marks = False
+
+    def walk(name: str, prefix: str) -> None:
+        nonlocal marks
+        deps = res.graph[name]
+        for i, dep in enumerate(deps):
+            last = i == len(deps) - 1
+            branch = "└── " if last else "├── "
+            text = prefix + branch + _label(res, dep)
+            if dep in path:
+                lines.append(text + " (цикл)")
+                marks = True
+            elif dep in shown and res.graph[dep]:
+                lines.append(text + " (*)")
+                marks = True
+            else:
+                lines.append(text)
+                shown.add(dep)
+                path.add(dep)
+                walk(dep, prefix + ("    " if last else "│   "))
+                path.discard(dep)
+
+    walk(res.root, "")
+    if marks:
+        lines.append("(*) — поддерево показано выше; (цикл) — возврат к пакету-предку")
+    return "\n".join(lines)
+
+
+_PUML_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+
+
+def plantuml_encode(text: str) -> str:
+    """Кодирование текста диаграммы для URL сервера PlantUML (deflate + свой base64)."""
+    data = zlib.compress(text.encode("utf-8"), 9)[2:-4]
+    out = []
+    for i in range(0, len(data), 3):
+        chunk = data[i:i + 3]
+        b1, b2, b3 = chunk[0], chunk[1] if len(chunk) > 1 else 0, chunk[2] if len(chunk) > 2 else 0
+        out.append(_PUML_ALPHABET[b1 >> 2])
+        out.append(_PUML_ALPHABET[((b1 & 0x3) << 4) | (b2 >> 4)])
+        out.append(_PUML_ALPHABET[((b2 & 0xF) << 2) | (b3 >> 6)])
+        out.append(_PUML_ALPHABET[b3 & 0x3F])
+    return "".join(out)
+
+
+def render_png_server(puml: str, output: str, server: str = PLANTUML_SERVER) -> None:
+    url = f"{server.rstrip('/')}/png/{plantuml_encode(puml)}"
+    if len(url) > 8000:
+        raise RenderError("диаграмма слишком велика для запроса к серверу PlantUML; "
+                          "используйте --plantuml-jar")
+    try:
+        png = http_get(url)
+    except RepoError as e:
+        raise RenderError(f"сервер PlantUML недоступен или отклонил запрос: {e}") from e
+    if not png.startswith(b"\x89PNG"):
+        raise RenderError("сервер PlantUML вернул не PNG-изображение")
+    with open(output, "wb") as f:
+        f.write(png)
+
+
+def render_png_jar(puml_path: str, jar: str, output: str) -> None:
+    java = shutil.which("java")
+    if not java:
+        raise RenderError("Java не найдена в PATH (нужна для plantuml.jar)")
+    try:
+        proc = subprocess.run([java, "-jar", jar, "-tpng", "-charset", "UTF-8", puml_path],
+                              capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as e:
+        raise RenderError("plantuml.jar не завершился за 120 секунд") from e
+    if proc.returncode != 0:
+        raise RenderError(f"plantuml.jar завершился с ошибкой: {(proc.stderr or proc.stdout).strip()}")
+    if not os.path.isfile(output):
+        raise RenderError(f"plantuml.jar не создал файл '{output}'")
+
+
+def save_visualization(res: GraphResult, output: str, jar: str = "") -> str:
+    """Сохраняет .puml рядом с PNG и строит PNG. Возвращает путь к .puml."""
+    puml = to_plantuml(res)
+    puml_path = os.path.splitext(output)[0] + ".puml"
+    try:
+        with open(puml_path, "w", encoding="utf-8") as f:
+            f.write(puml)
+    except OSError as e:
+        raise RenderError(f"не удалось записать '{puml_path}': {e}") from e
+    print(f"Текст PlantUML сохранён: {puml_path}")
+    try:
+        if jar:
+            render_png_jar(puml_path, jar, output)
+        else:
+            render_png_server(puml, output)
+    except OSError as e:
+        raise RenderError(f"не удалось записать '{output}': {e}") from e
+    return puml_path
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv) 
@@ -493,12 +627,20 @@ def main(argv=None) -> int:
 
     if cfg.load_order:
         print_load_order(result, cfg.filter)
-    else:
-        print_graph(result, cfg.filter)
+        return 0
+
+    print_graph(result, cfg.filter)
+    if cfg.ascii_tree:
+        print("\nASCII-дерево зависимостей:")
+        print(ascii_tree(result))
+    try:
+        save_visualization(result, cfg.output, cfg.plantuml_jar)
+    except RenderError as e:
+        print(f"Ошибка визуализации: {e}", file=sys.stderr)
+        return 4
+    print(f"Изображение графа сохранено: {cfg.output}")
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
- 
