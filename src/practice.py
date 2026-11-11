@@ -2,11 +2,14 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -19,6 +22,7 @@ VERSION_RE = re.compile(
 FORBIDDEN_FILENAME_CHARS = set('<>:"|?*\0')
 HTTP_TIMEOUT = 15  
 USER_AGENT = "depgraph/0.3 (educational project)"
+PLANTUML_SERVER = "https://www.plantuml.com/plantuml"
 
 
 class ConfigError(Exception):
@@ -38,6 +42,8 @@ class Config:
     output: str
     ascii_tree: bool
     filter: str
+    load_order: bool = False
+    plantuml_jar: str = ""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,6 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="вывести зависимости в виде ASCII-дерева")
     p.add_argument("-f", "--filter", default="",
                    help="подстрока: пакеты, в имени которых она есть, не анализируются")
+    p.add_argument("-l", "--load-order", action="store_true",
+                   help="вывести порядок загрузки зависимостей вместо графа")
+    p.add_argument("--plantuml-jar", default="",
+                   help="путь к plantuml.jar (если не указан, используется сервер PlantUML)")
     return p
 
 
@@ -105,7 +115,7 @@ def validate_version(version: str, test_mode: bool) -> None:
             f"--version: '{version}' не соответствует формату версии (пример: 1.2.3, 1.0.0-beta.1)")
 
 
-def validate_output(output: str) -> None:
+def _validate_output_name(output: str) -> None:
     if not output or not output.strip():
         raise ConfigError("--output: имя файла не может быть пустым")
     if any(c in FORBIDDEN_FILENAME_CHARS for c in output):
@@ -114,6 +124,9 @@ def validate_output(output: str) -> None:
         raise ConfigError(f"--output: файл должен иметь расширение .png, получено '{output}'")
     if os.path.basename(output) in ("", ".png"):
         raise ConfigError("--output: у файла отсутствует имя")
+
+
+def _validate_output_location(output: str) -> None:
     directory = os.path.dirname(output) or "."
     if not os.path.isdir(directory):
         raise ConfigError(f"--output: каталог '{directory}' не существует")
@@ -121,6 +134,11 @@ def validate_output(output: str) -> None:
         raise ConfigError(f"--output: '{output}' — это каталог")
     if not os.access(directory, os.W_OK):
         raise ConfigError(f"--output: нет прав на запись в каталог '{directory}'")
+
+
+def validate_output(output: str) -> None:
+    _validate_output_name(output)
+    _validate_output_location(output)
 
 
 def validate_filter(substr: str, package: str) -> None:
@@ -150,7 +168,8 @@ def validate(args: argparse.Namespace) -> Config:
     if errors:
         raise ConfigError("\n".join(errors))
     return Config(args.package, args.repo, args.test_mode, args.version,
-                  args.output, args.ascii_tree, args.filter)
+                  args.output, args.ascii_tree, args.filter,
+                  args.load_order, args.plantuml_jar)
 
 
 @dataclass
@@ -181,8 +200,8 @@ def http_get(url: str) -> bytes:
         raise RepoError(f"не удалось подключиться к {url}: {e.reason}") from e
 
 
-def find_package_base_address(index_url: str) -> str:
-    """Читает service index (v3/index.json) и находит ресурс PackageBaseAddress."""
+def _load_resources(index_url: str) -> list:
+    """Скачивает service index и возвращает список 'resources'."""
     raw = http_get(index_url)
     try:
         index = json.loads(raw.decode("utf-8-sig"))
@@ -192,14 +211,26 @@ def find_package_base_address(index_url: str) -> str:
     resources = index.get("resources") if isinstance(index, dict) else None
     if not isinstance(resources, list):
         raise RepoError(f"в {index_url} нет списка 'resources': это не NuGet v3 service index")
+    return resources
 
-    for res in resources:
-        types = res.get("@type", []) if isinstance(res, dict) else []
-        if isinstance(types, str):
-            types = [types]
-        if any(t.startswith("PackageBaseAddress") for t in types) and res.get("@id"):
-            base = res["@id"]
-            return base if base.endswith("/") else base + "/"
+
+def _package_base_of(res) -> Optional[str]:
+    """Возвращает URL (с завершающим '/'), если ресурс — PackageBaseAddress, иначе None."""
+    types = res.get("@type", []) if isinstance(res, dict) else []
+    if isinstance(types, str):
+        types = [types]
+    if any(t.startswith("PackageBaseAddress") for t in types) and res.get("@id"):
+        base = res["@id"]
+        return base if base.endswith("/") else base + "/"
+    return None
+
+
+def find_package_base_address(index_url: str) -> str:
+    """Читает service index (v3/index.json) и находит ресурс PackageBaseAddress."""
+    for res in _load_resources(index_url):
+        base = _package_base_of(res)
+        if base is not None:
+            return base
     raise RepoError("в service index не найден ресурс PackageBaseAddress")
 
 
@@ -208,41 +239,53 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def parse_dependencies(nuspec: bytes) -> List[Dependency]:
-    """Извлекает <dependency> из всех <group> (и из <dependencies> без групп)."""
+def _find_child(parent, name: str):
+    return next((c for c in parent if local_name(c.tag) == name), None)
+
+
+def _dependencies_element(nuspec: bytes):
+    """Разбирает XML и возвращает <dependencies> (или None, если его нет)."""
     try:
         root = ET.fromstring(nuspec)
     except ET.ParseError as e:
         raise RepoError(f"некорректный XML в .nuspec: {e}") from e
 
-    metadata = next((c for c in root if local_name(c.tag) == "metadata"), None)
+    metadata = _find_child(root, "metadata")
     if metadata is None:
         raise RepoError("в .nuspec отсутствует элемент <metadata>")
-    deps_el = next((c for c in metadata if local_name(c.tag) == "dependencies"), None)
-    if deps_el is None:
-        return []  
+    return _find_child(metadata, "dependencies")
 
+
+def _add_dependency(found: Dict[str, Dependency], dep_el, framework: str) -> None:
+    dep_id = dep_el.get("id")
+    if not dep_id:
+        return
+    key = dep_id.lower()
+    dep = found.setdefault(key, Dependency(dep_id, dep_el.get("version", "")))
+    if framework not in dep.frameworks:
+        dep.frameworks.append(framework)
+
+
+def _collect_dependencies(deps_el) -> List[Dependency]:
     found: Dict[str, Dependency] = {}
-
-    def add(dep_el, framework: str) -> None:
-        dep_id = dep_el.get("id")
-        if not dep_id:
-            return
-        key = dep_id.lower() 
-        dep = found.setdefault(key, Dependency(dep_id, dep_el.get("version", "")))
-        if framework not in dep.frameworks:
-            dep.frameworks.append(framework)
-
     for child in deps_el:
         name = local_name(child.tag)
         if name == "group":
             fw = child.get("targetFramework") or "any"
             for d in child:
                 if local_name(d.tag) == "dependency":
-                    add(d, fw)
+                    _add_dependency(found, d, fw)
         elif name == "dependency":
-            add(child, "any")
+            _add_dependency(found, child, "any")
     return list(found.values())
+
+
+def parse_dependencies(nuspec: bytes) -> List[Dependency]:
+    """Извлекает <dependency> из всех <group> (и из <dependencies> без групп)."""
+    deps_el = _dependencies_element(nuspec)
+    if deps_el is None:
+        return []
+    return _collect_dependencies(deps_el)
 
 
 def resolve_version(version_range: str) -> str:
@@ -643,4 +686,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main())n())
