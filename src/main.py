@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+
 NUGET_ID_RE = re.compile(r"^[A-Za-z0-9_]+([.-][A-Za-z0-9_]+)*$")
 TEST_ID_RE = re.compile(r"^[A-Z]+$")  
 VERSION_RE = re.compile(
@@ -323,9 +324,7 @@ def get_direct_dependencies(repo_url: str, package: str, version: str,
         raise
     return parse_dependencies(nuspec)
 
-
 ChildrenFn = Callable[[str, str], List[Tuple[str, str]]]
-
 
 @dataclass
 class GraphResult:
@@ -686,4 +685,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())n())
+    sys.exit(main())
