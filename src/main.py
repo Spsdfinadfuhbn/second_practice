@@ -325,6 +325,7 @@ def resolve_version(version_range: str) -> str:
     """Выбирает конкретную версию из диапазона NuGet: нижнюю границу.
 
     "1.0" -> 1.0; "[1.0, )" -> 1.0; "[1.0]" -> 1.0; "(, 2.0]" -> 2.0.
+    Если нижней границы нет, берётся верхняя.
     Исключающие границы упрощённо трактуются как включающие.
     """
     rng = version_range.strip()
@@ -332,7 +333,6 @@ def resolve_version(version_range: str) -> str:
         return ""
     if rng.startswith(("[", "(")):
         parts = [p.strip() for p in rng[1:-1].split(",")]
-        # нижняя граница, а если её нет — верхняя
         return parts[0] or "".join(parts[1:2])
     return rng
 
@@ -371,7 +371,7 @@ class GraphResult:
     skipped: List[str]
 
 
-class _GraphBuilder:
+class GraphBuilder:
     """Состояние рекурсивного DFS при построении графа зависимостей."""
 
     def __init__(self, get_children: ChildrenFn, substring: str):
@@ -426,7 +426,7 @@ def build_graph(root: str, root_version: str, get_children: ChildrenFn,
     * Уже обработанный пакет повторно не раскрывается (ромбовидные
       зависимости).
     """
-    builder = _GraphBuilder(get_children, substring)
+    builder = GraphBuilder(get_children, substring)
     root = builder.canon.setdefault(root.lower(), root)
     builder.dfs(root, root_version)
     return GraphResult(root, builder.graph, builder.versions,

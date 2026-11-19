@@ -5,6 +5,7 @@
 """
 import ast
 import functools
+import importlib
 import io
 import json
 import os
@@ -21,7 +22,7 @@ from urllib.error import HTTPError, URLError
 SRC_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), os.pardir, "src")
 sys.path.insert(0, os.path.abspath(SRC_DIR))
-import main as dg  # noqa: E402
+dg = importlib.import_module("main")
 
 COMPLEXITY_LIMIT = 10
 DEEP_CHAIN_LENGTH = 1500
