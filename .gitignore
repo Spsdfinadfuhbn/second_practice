@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.idea/
+*.iml
+__pycache__/
+graph.png
+graph.puml
